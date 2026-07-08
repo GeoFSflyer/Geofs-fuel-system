@@ -1,7 +1,6 @@
 // ==============================================================
 // GeoFS Fighter Jet Realistic Fuel System
-// Version: 4.2.0 (with F-35B tuned burn & refuel fixes)
-// Repository: https://github.com/GeoFSflyer/Geofs-fuel-system
+// Version: 4.2.0 (F-35B tuned burn & AB detection)
 // ==============================================================
 
 (function () {
@@ -19,7 +18,7 @@
         'f-14':        { capacity:  7348, engines: 2, name: 'F-14B Tomcat'          },
         'f-15':        { capacity:  6103, engines: 2, name: 'F-15C Eagle'           },
         'f-22':        { capacity:  8200, engines: 2, name: 'F-22 Raptor'           },
-        // F-35B internal fuel ≈ 6125 kg (13,500 lb) — already realistic
+        // F-35B internal fuel ≈ 6125 kg (13,500 lb) — realistic
         'f-35':        { capacity:  6125, engines: 1, name: 'F-35B Lightning II'    },
         'yf-23':       { capacity:  8600, engines: 2, name: 'YF-23'                 },
         'su-35':       { capacity: 11500, engines: 2, name: 'Su-35'                 },
@@ -56,7 +55,7 @@
         autoNearestBase:     true,
         reserveMinutes:      10,
         cruiseSpeedKmh:      900,
-        refuelDuration:      REFUEL_DURATION_S,  // user-adjustable in settings
+        refuelDuration:      REFUEL_DURATION_S,
         bases:               [],
         selectedBaseIndex:   0
     };
@@ -89,26 +88,32 @@
     }
 
     function hasAfterburner(engines) {
+        if (!engines || !engines.length) return false;
         const e = engines[0];
         return (e.afterBurnerThrust  != null && e.afterBurnerThrust  > 0) ||
                (e.afterburnerThrust  != null && e.afterburnerThrust  > 0);
     }
 
     function isAbActive(engines, throttle) {
-        if (!hasAfterburner(engines)) return false;
+        if (!engines || !engines.length) return false;
         const e = engines[0];
-        // Named flags first (most reliable)
-        if (e.afterburnerLit != null) return !!e.afterburnerLit;
-        if (e.afterburnerOn  != null) return !!e.afterburnerOn;
-        if (e.abLit          != null) return !!e.abLit;
-        if (e.abOn           != null) return !!e.abOn;
+
+        // 1) Explicit flags commonly used in GeoFS aircraft
+        if (e.afterburnerLit != null)   return !!e.afterburnerLit;
+        if (e.afterburnerOn  != null)   return !!e.afterburnerOn;
+        if (e.abLit          != null)   return !!e.abLit;
+        if (e.abOn           != null)   return !!e.abOn;
         if (typeof e.afterburner === 'boolean') return e.afterburner;
-        // Thrust-ratio method
-        const dry  = e.thrust || 0;
-        const live = e.currentThrust || e.outputThrust || 0;
-        if (dry > 0 && live > dry * 1.05) return true;
-        // Throttle-threshold fallback
-        return throttle > 0.9;
+
+        // 2) Thrust ratio — if current thrust is clearly above dry thrust, treat as AB
+        const dry   = e.thrust || 0;
+        const live  = e.currentThrust || e.outputThrust || 0;
+        if (dry > 0 && live > dry * 1.20) { // slightly more lenient than 1.05
+            return true;
+        }
+
+        // 3) Throttle threshold as final fallback
+        return throttle > 0.92;
     }
 
     // ──────────────────────────────────────────────────────────
@@ -126,26 +131,23 @@
         const abActive        = isAbActive(engines, throttle);
 
         // Tunable ratios:
-        // - idleFractionOfMil: idle fuel ≈ 8% of mil
-        // - abFactorOverMil: AB burns ~60% more fuel than mil
-        const idleFractionOfMil = 0.08;
-        const abFactorOverMil   = 1.6;
+        const idleFractionOfMil = 0.08;  // idle ≈ 8% of mil fuel flow
+        const abFactorOverMil   = 1.6;   // AB ≈ 60% more fuel than mil
 
-        // Full mil burn tied to total dry thrust:
-        // Using /22 instead of /15 gives longer endurance at mil power.
+        // Mil fuel tied to dry thrust: higher divisor = longer endurance
         const fullMilBurnRate = totalDryThrust / 22;
         const idleBurnRate    = fullMilBurnRate * idleFractionOfMil;
 
         if (abActive && totalAbThrust > 0) {
             const abBurnRate = fullMilBurnRate * abFactorOverMil;
-            // Blend AB in only near the top of the throttle range
+            // Blend AB near top of throttle only
             const abBlend = Math.max(0, throttle - 0.85) / 0.15; // 0 at 0.85, 1 at 1.0
             return idleBurnRate +
                    (fullMilBurnRate - idleBurnRate) * throttle +
                    (abBurnRate - fullMilBurnRate) * abBlend;
         }
 
-        // Dry operation (idle → mil)
+        // Dry (idle → mil)
         return idleBurnRate + throttle * (fullMilBurnRate - idleBurnRate);
     }
 
@@ -177,7 +179,7 @@
     function haversineKm(lat1, lon1, lat2, lon2) {
         const R    = 6371;
         const dLat = toRad(lat2 - lat1);
-        const dLon = toRad(lon2 - lon1);
+        const dLon = toRad(lat2 - lon1);
         const a    = Math.sin(dLat / 2) ** 2 +
                      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
         return 2 * R * Math.asin(Math.sqrt(a));
@@ -242,7 +244,6 @@
             return;
         }
         if (fuelState.refuelling) {
-            // Clicking again cancels
             cancelRefuel();
             return;
         }
@@ -253,7 +254,7 @@
         fuelState.refuelling      = true;
         fuelState.refuelStartFuel = fuelState.fuel;
         fuelState.refuelStartTime = Date.now();
-        fuelState.refuelDuration  = settings.refuelDuration; // lock duration for this cycle
+        fuelState.refuelDuration  = settings.refuelDuration;
         console.log('[Fuel] Refuelling started — ' + fuelState.refuelDuration + 's to full');
     }
 
@@ -268,7 +269,6 @@
     function tickRefuel() {
         if (!fuelState.refuelling) return;
 
-        // Abort conditions
         if (!canRefuel()) {
             cancelRefuel();
             return;
@@ -341,7 +341,8 @@
 
             + '<label style="' + row + '">'
             +   '<span>Reserve (minutes)</span>'
-            +   '<input id="fuel-reserve-min" type="number" min="0" value="' + settings.reserveMinutes + '" style="' + inp + '">'
+            +   '<input id="fuel-reserve-min' +
+                 '" type="number" min="0" value="' + settings.reserveMinutes + '" style="' + inp + '">'
             + '</label>'
 
             + '<label style="' + row + '">'
@@ -610,11 +611,9 @@
         if (!inst || !inst.aircraftRecord) return;
         const id = inst.aircraftRecord.id;
 
-        // Only reset capacity when aircraft ID truly changes
         if (fuelState.lastAircraft !== id || !fuelState.initialized) {
             fuelState.maxFuel      = getFuelCapacity();
             if (!fuelState.initialized || fuelState.lastAircraft !== id) {
-                // On first load or true aircraft change, seed fuel to full
                 fuelState.fuel = fuelState.maxFuel;
             }
             fuelState.lastAircraft = id;
@@ -622,7 +621,6 @@
             console.log('[Fuel v' + VERSION + '] ' + detectAircraftType() + ' | Capacity: ' + fuelState.maxFuel + ' kg');
         }
 
-        // HUD can be recreated safely without touching fuel/refuel state
         if (!document.getElementById('geofs-fuel-hud')) {
             createHUD();
         }
