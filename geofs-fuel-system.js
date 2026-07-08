@@ -1,55 +1,48 @@
 // ==============================================================
 // GeoFS Fighter Jet Realistic Fuel System
-// Version: 4.2.0
+// Version: 4.2.0 (with F-35B tuned burn & refuel fixes)
 // Repository: https://github.com/GeoFSflyer/Geofs-fuel-system
-// ==============================================================
-// Changes in 4.2.0:
-//   - Tick rate: 200ms (5Hz) — engine-off and throttle changes
-//     now register within 200ms instead of up to 1000ms.
-//     Fuel math uses actual elapsed time so totals stay accurate.
-//   - Progressive refuelling: tank fills over REFUEL_DURATION_S
-//     (default 45 s, range 30-60 s per GMRP rearming rules).
-//     Animated progress bar shown in HUD. Fuelling aborts if
-//     the engine is started or the aircraft moves.
 // ==============================================================
 
 (function () {
     'use strict';
 
-    const VERSION        = '4.2.0';
-    const TICK_MS        = 200;         // update interval — 5 Hz
-    const TICK_S         = TICK_MS / 1000;
-    const REFUEL_DURATION_S = 45;       // seconds to fill from 0 → 100 %
+    const VERSION           = '4.2.0';
+    const TICK_MS           = 200;         // update interval — 5 Hz
+    const TICK_S            = TICK_MS / 1000;
+    const REFUEL_DURATION_S = 45;         // seconds to fill from 0 → 100 %
 
     // ── Aircraft fuel database ────────────────────────────────
     const FIGHTER_FUEL_DB = {
         'f-16':        { capacity:  3175, engines: 1, name: 'F-16 Fighting Falcon'  },
         'f/a-18f':     { capacity:  6532, engines: 2, name: 'F/A-18F Super Hornet'  },
-        'f-14':        { capacity:  7348, engines: 2, name: 'F-14B Tomcat'           },
-        'f-15':        { capacity:  6103, engines: 2, name: 'F-15C Eagle'            },
-        'f-22':        { capacity:  8200, engines: 2, name: 'F-22 Raptor'            },
-        'f-35':        { capacity:  6125, engines: 1, name: 'F-35B Lightning II'     },
-        'yf-23':       { capacity:  8600, engines: 2, name: 'YF-23'                  },
-        'su-35':       { capacity: 11500, engines: 2, name: 'Su-35'                  },
-        'rafale':      { capacity:  4700, engines: 2, name: 'Dassault Rafale'        },
-        'mirage f1':   { capacity:  4300, engines: 1, name: 'Mirage F1'              },
-        'mirage 2000': { capacity:  3978, engines: 1, name: 'Mirage 2000-5'          },
-        'j-20':        { capacity: 11340, engines: 2, name: 'Chengdu J-20'           },
-        'a-10':        { capacity:  4853, engines: 2, name: 'A-10C Thunderbolt II'   },
-        'alpha':       { capacity:  1900, engines: 2, name: 'Alpha Jet'              },
-        't-38':        { capacity:  1540, engines: 2, name: 'T-38 Talon'             }
+        'f-14':        { capacity:  7348, engines: 2, name: 'F-14B Tomcat'          },
+        'f-15':        { capacity:  6103, engines: 2, name: 'F-15C Eagle'           },
+        'f-22':        { capacity:  8200, engines: 2, name: 'F-22 Raptor'           },
+        // F-35B internal fuel ≈ 6125 kg (13,500 lb) — already realistic
+        'f-35':        { capacity:  6125, engines: 1, name: 'F-35B Lightning II'    },
+        'yf-23':       { capacity:  8600, engines: 2, name: 'YF-23'                 },
+        'su-35':       { capacity: 11500, engines: 2, name: 'Su-35'                 },
+        'rafale':      { capacity:  4700, engines: 2, name: 'Dassault Rafale'       },
+        'mirage f1':   { capacity:  4300, engines: 1, name: 'Mirage F1'             },
+        'mirage 2000': { capacity:  3978, engines: 1, name: 'Mirage 2000-5'         },
+        'j-20':        { capacity: 11340, engines: 2, name: 'Chengdu J-20'          },
+        'a-10':        { capacity:  4853, engines: 2, name: 'A-10C Thunderbolt II'  },
+        'alpha':       { capacity:  1900, engines: 2, name: 'Alpha Jet'             },
+        't-38':        { capacity:  1540, engines: 2, name: 'T-38 Talon'            }
     };
 
     // ── State ─────────────────────────────────────────────────
     let fuelState = {
-        fuel:          0,
-        maxFuel:       0,
-        initialized:   false,
-        lastAircraft:  null,
+        fuel:             0,
+        maxFuel:          0,
+        initialized:      false,
+        lastAircraft:     null,
         // Refuelling
-        refuelling:     false,
-        refuelStartFuel: 0,
-        refuelStartTime: null
+        refuelling:       false,
+        refuelStartFuel:  0,
+        refuelStartTime:  null,
+        refuelDuration:   REFUEL_DURATION_S
     };
 
     let hudVisible  = true;
@@ -89,7 +82,7 @@
     }
 
     // ──────────────────────────────────────────────────────────
-    // AFTERBURNER DETECTION
+    // AFTERburner DETECTION
     // ──────────────────────────────────────────────────────────
     function getAbThrust(engine) {
         return engine.afterBurnerThrust || engine.afterburnerThrust || 0;
@@ -119,9 +112,7 @@
     }
 
     // ──────────────────────────────────────────────────────────
-    // BURN RATE  (kg / hr)
-    // Returns 0 when engine is off — the caller multiplies by
-    // TICK_S/3600 to get kg burned this tick.
+    // BURN RATE  (kg / hr) — tuned mil vs AB
     // ──────────────────────────────────────────────────────────
     function calculateBurnRate() {
         const instance = window.geofs.aircraft.instance;
@@ -130,16 +121,31 @@
         if (!engines || engines.length === 0) return 0;
 
         const throttle        = Math.abs(window.geofs.animation.values.smoothThrottle || 0);
-        const totalDryThrust  = engines.reduce((s, e) => s + (e.thrust     || 0), 0);
-        const totalAbThrust   = engines.reduce((s, e) => s + getAbThrust(e),       0);
+        const totalDryThrust  = engines.reduce((s, e) => s + (e.thrust || 0), 0);
+        const totalAbThrust   = engines.reduce((s, e) => s + getAbThrust(e), 0);
         const abActive        = isAbActive(engines, throttle);
-        const idleBurnRate    = totalDryThrust / 120;
-        const fullMilBurnRate = totalDryThrust / 15;
+
+        // Tunable ratios:
+        // - idleFractionOfMil: idle fuel ≈ 8% of mil
+        // - abFactorOverMil: AB burns ~60% more fuel than mil
+        const idleFractionOfMil = 0.08;
+        const abFactorOverMil   = 1.6;
+
+        // Full mil burn tied to total dry thrust:
+        // Using /22 instead of /15 gives longer endurance at mil power.
+        const fullMilBurnRate = totalDryThrust / 22;
+        const idleBurnRate    = fullMilBurnRate * idleFractionOfMil;
 
         if (abActive && totalAbThrust > 0) {
-            const abRatio = totalAbThrust / totalDryThrust;
-            return fullMilBurnRate * (1 + (abRatio - 1) * 1.5) * throttle;
+            const abBurnRate = fullMilBurnRate * abFactorOverMil;
+            // Blend AB in only near the top of the throttle range
+            const abBlend = Math.max(0, throttle - 0.85) / 0.15; // 0 at 0.85, 1 at 1.0
+            return idleBurnRate +
+                   (fullMilBurnRate - idleBurnRate) * throttle +
+                   (abBurnRate - fullMilBurnRate) * abBlend;
         }
+
+        // Dry operation (idle → mil)
         return idleBurnRate + throttle * (fullMilBurnRate - idleBurnRate);
     }
 
@@ -147,10 +153,11 @@
         const engines = window.geofs.aircraft.instance.engines || [];
         if (!engines.length) return 0;
         const totalDry  = engines.reduce((s, e) => s + (e.thrust || 0), 0);
-        const idle      = totalDry / 120;
-        const milMax    = totalDry / 15;
-        const cruiseEst = idle + 0.55 * (milMax - idle);
-        const actual    = calculateBurnRate();
+        const idleFractionOfMil = 0.08;
+        const fullMilBurnRate   = totalDry / 22;
+        const idle              = fullMilBurnRate * idleFractionOfMil;
+        const cruiseEst         = idle + 0.55 * (fullMilBurnRate - idle);
+        const actual            = calculateBurnRate();
         return actual > 0 ? Math.min(actual, cruiseEst * 1.15) : cruiseEst;
     }
 
@@ -218,8 +225,6 @@
     // ──────────────────────────────────────────────────────────
     // REFUELLING
     // ──────────────────────────────────────────────────────────
-
-    // Returns true if conditions allow refuelling.
     function canRefuel() {
         const inst = window.geofs.aircraft.instance;
         return inst.groundContact && !inst.engine.on && inst.groundSpeed < 1;
@@ -248,7 +253,8 @@
         fuelState.refuelling      = true;
         fuelState.refuelStartFuel = fuelState.fuel;
         fuelState.refuelStartTime = Date.now();
-        console.log('[Fuel] Refuelling started — ' + settings.refuelDuration + 's to full');
+        fuelState.refuelDuration  = settings.refuelDuration; // lock duration for this cycle
+        console.log('[Fuel] Refuelling started — ' + fuelState.refuelDuration + 's to full');
     }
 
     function cancelRefuel() {
@@ -259,7 +265,6 @@
         console.log('[Fuel] Refuelling cancelled at ' + fuelState.fuel.toFixed(0) + ' kg');
     }
 
-    // Called every tick while refuelling is active.
     function tickRefuel() {
         if (!fuelState.refuelling) return;
 
@@ -269,17 +274,16 @@
             return;
         }
 
-        const elapsed  = (Date.now() - fuelState.refuelStartTime) / 1000; // seconds
-        const duration = settings.refuelDuration;
+        const elapsed  = (Date.now() - fuelState.refuelStartTime) / 1000;
+        const duration = fuelState.refuelDuration;
         const target   = fuelState.maxFuel;
         const start    = fuelState.refuelStartFuel;
 
-        // Linear fill: startFuel + (elapsed/duration) * (max - start)
         const progress = Math.min(1, elapsed / duration);
         fuelState.fuel = start + progress * (target - start);
 
         if (progress >= 1) {
-            fuelState.fuel     = target;
+            fuelState.fuel       = target;
             fuelState.refuelling = false;
             console.log('[Fuel] Refuelling complete: ' + target + ' kg');
         }
@@ -318,19 +322,16 @@
             + '</div>'
             + '<div style="padding:12px;display:grid;gap:10px;">'
 
-            // Dynamic bingo
             + '<label style="display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer;">'
             +   '<span>Dynamic RTB bingo</span>'
             +   '<input id="fuel-dynbingo-toggle" type="checkbox"' + (settings.dynamicBingoEnabled ? ' checked' : '') + '>'
             + '</label>'
 
-            // Auto nearest base
             + '<label style="display:flex;justify-content:space-between;align-items:center;gap:8px;cursor:pointer;">'
             +   '<span>Auto nearest base</span>'
             +   '<input id="fuel-autonear-toggle" type="checkbox"' + (settings.autoNearestBase ? ' checked' : '') + '>'
             + '</label>'
 
-            // Manual base selector
             + '<div id="fuel-manual-base-row" style="' + row + (settings.autoNearestBase ? 'display:none;' : '') + '">'
             +   '<span>Selected base</span>'
             +   '<select id="fuel-base-select" style="' + inp + '">'
@@ -338,28 +339,23 @@
             +   '</select>'
             + '</div>'
 
-            // Reserve minutes
             + '<label style="' + row + '">'
             +   '<span>Reserve (minutes)</span>'
             +   '<input id="fuel-reserve-min" type="number" min="0" value="' + settings.reserveMinutes + '" style="' + inp + '">'
             + '</label>'
 
-            // Cruise speed
             + '<label style="' + row + '">'
             +   '<span>Planning cruise speed (km/h)</span>'
             +   '<input id="fuel-cruise-speed" type="number" min="100" value="' + settings.cruiseSpeedKmh + '" style="' + inp + '">'
             + '</label>'
 
-            // Refuel duration
             + '<label style="' + row + '">'
             +   '<span>Refuel duration (seconds, 30–60)</span>'
             +   '<input id="fuel-refuel-dur" type="number" min="30" max="60" value="' + settings.refuelDuration + '" style="' + inp + '">'
             + '</label>'
 
-            // Add base
             + '<button id="fuel-add-base" style="padding:8px;background:rgba(0,255,136,0.1);border:1px solid rgba(0,255,136,0.3);border-radius:6px;color:#00ff88;cursor:pointer;font-family:monospace;">+ Add current position as base</button>'
 
-            // Base list
             + '<div id="fuel-base-list" style="max-height:120px;overflow:auto;border:1px solid rgba(0,255,136,0.1);border-radius:6px;padding:6px;background:#0a0a0a;">'
             +   buildBaseListHTML()
             + '</div>'
@@ -454,7 +450,6 @@
             + 'user-select:none;box-shadow:0 4px 24px rgba(0,255,100,0.12);';
 
         hud.innerHTML = ''
-            // Title / drag handle
             + '<div id="fuel-drag-handle" title="Drag to move"'
             +   ' style="padding:8px 12px 6px;cursor:grab;border-bottom:1px solid rgba(0,255,136,0.15);'
             +          'display:flex;justify-content:space-between;align-items:center;'
@@ -462,14 +457,11 @@
             +   '<span style="font-size:10px;color:#00ff88;letter-spacing:2px;flex-shrink:0;">\u2708 FUEL SYS</span>'
             +   '<span id="fuel-ac-name" style="font-size:9px;color:#555;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right;">--</span>'
             + '</div>'
-            // Body
             + '<div style="padding:10px 12px;">'
             +   '<div id="fuel-pct" style="font-size:28px;font-weight:bold;text-align:center;margin-bottom:4px;">100%</div>'
-            // Main fuel bar
             +   '<div style="width:100%;height:12px;background:#111;border-radius:6px;overflow:hidden;margin-bottom:4px;">'
             +     '<div id="fuel-bar" style="height:100%;width:100%;background:#22c55e;border-radius:6px;transition:width 0.18s linear;"></div>'
             +   '</div>'
-            // Refuel progress bar (hidden until fuelling starts)
             +   '<div id="refuel-bar-wrap" style="width:100%;height:6px;background:#111;border-radius:6px;overflow:hidden;margin-bottom:6px;display:none;">'
             +     '<div id="refuel-bar" style="height:100%;width:0%;background:#eab308;border-radius:6px;transition:width 0.18s linear;"></div>'
             +   '</div>'
@@ -481,17 +473,13 @@
             +     '<span>ENDUR: <span id="endurance">--</span></span>'
             +     '<span>AB: <span id="ab-status" style="color:#ff8800;">OFF</span></span>'
             +   '</div>'
-            // Dynamic RTB bingo
             +   '<div id="dynamic-bingo-box" style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,255,136,0.12);font-size:10px;display:none;">'
             +     '<div style="display:flex;justify-content:space-between;"><span>RTB BINGO:</span><span id="dynamic-bingo-fuel" style="color:#eab308;">--</span></div>'
             +     '<div style="display:flex;justify-content:space-between;"><span>BASE:</span><span id="dynamic-bingo-base" style="color:#888;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:160px;">--</span></div>'
             +     '<div style="display:flex;justify-content:space-between;"><span>DIST:</span><span id="dynamic-bingo-dist">--</span></div>'
             +   '</div>'
-            // Warning
             +   '<div id="fuel-warn" style="text-align:center;margin-top:4px;font-size:10px;font-weight:bold;color:#ff2244;display:none;"></div>'
-            // Refuel status text
             +   '<div id="refuel-status" style="text-align:center;margin-top:4px;font-size:10px;color:#eab308;display:none;"></div>'
-            // Buttons
             +   '<div style="display:flex;gap:6px;margin-top:8px;">'
             +     '<button id="geofs-refuel-btn"'
             +       ' style="flex:1;padding:6px 0;background:rgba(234,179,8,0.15);'
@@ -528,13 +516,11 @@
         const acType   = detectAircraftType();
         const acData   = acType && FIGHTER_FUEL_DB[acType];
 
-        // Aircraft name
         const acNameEl = document.getElementById('fuel-ac-name');
         if (acNameEl) acNameEl.textContent = acData
             ? acData.name
             : (window.geofs.aircraft.instance.aircraftRecord.name || '--');
 
-        // Percentage + colour
         const pctColor = pct > 25 ? '#22c55e' : pct > 10 ? '#eab308' : '#ef4444';
         const pctEl    = document.getElementById('fuel-pct');
         if (pctEl) { pctEl.textContent = pct.toFixed(1) + '%'; pctEl.style.color = pctColor; }
@@ -559,14 +545,13 @@
         const abEl = document.getElementById('ab-status');
         if (abEl) { abEl.textContent = abActive ? 'ON' : 'OFF'; abEl.style.color = abActive ? '#ff4400' : '#ff8800'; }
 
-        // Refuel progress bar
         const rfWrap = document.getElementById('refuel-bar-wrap');
         const rfBar  = document.getElementById('refuel-bar');
         const rfStat = document.getElementById('refuel-status');
         if (fuelState.refuelling) {
             const elapsed  = (Date.now() - fuelState.refuelStartTime) / 1000;
-            const progress = Math.min(1, elapsed / settings.refuelDuration) * 100;
-            const secsLeft = Math.ceil(settings.refuelDuration - elapsed);
+            const progress = Math.min(1, elapsed / fuelState.refuelDuration) * 100;
+            const secsLeft = Math.ceil(fuelState.refuelDuration - elapsed);
             if (rfWrap) rfWrap.style.display = 'block';
             if (rfBar)  rfBar.style.width     = progress + '%';
             if (rfStat) { rfStat.style.display = 'block'; rfStat.textContent = '\u26fd Fuelling… ' + secsLeft + 's'; }
@@ -575,7 +560,6 @@
             if (rfStat) rfStat.style.display = 'none';
         }
 
-        // Dynamic RTB bingo
         const dyn    = calculateDynamicBingo();
         const dynBox = document.getElementById('dynamic-bingo-box');
         if (dynBox) dynBox.style.display = dyn ? 'block' : 'none';
@@ -588,7 +572,6 @@
             if (ddEl) ddEl.textContent = dyn.distanceKm.toFixed(0) + ' km';
         }
 
-        // Warning
         const warnEl = document.getElementById('fuel-warn');
         if (warnEl) {
             const rtbHit = dyn && fuelState.fuel <= dyn.bingoFuel;
@@ -606,7 +589,6 @@
             }
         }
 
-        // Refuel button label
         const refuelBtn = document.getElementById('geofs-refuel-btn');
         if (refuelBtn) {
             const og = window.geofs.aircraft.instance.groundContact;
@@ -624,14 +606,24 @@
     // INIT & MAIN LOOP
     // ──────────────────────────────────────────────────────────
     function initFuel() {
-        const id = window.geofs.aircraft.instance.aircraftRecord.id;
+        const inst = window.geofs.aircraft.instance;
+        if (!inst || !inst.aircraftRecord) return;
+        const id = inst.aircraftRecord.id;
+
+        // Only reset capacity when aircraft ID truly changes
         if (fuelState.lastAircraft !== id || !fuelState.initialized) {
-            cancelRefuel();
             fuelState.maxFuel      = getFuelCapacity();
-            fuelState.fuel         = fuelState.maxFuel;
+            if (!fuelState.initialized || fuelState.lastAircraft !== id) {
+                // On first load or true aircraft change, seed fuel to full
+                fuelState.fuel = fuelState.maxFuel;
+            }
             fuelState.lastAircraft = id;
             fuelState.initialized  = true;
             console.log('[Fuel v' + VERSION + '] ' + detectAircraftType() + ' | Capacity: ' + fuelState.maxFuel + ' kg');
+        }
+
+        // HUD can be recreated safely without touching fuel/refuel state
+        if (!document.getElementById('geofs-fuel-hud')) {
             createHUD();
         }
     }
@@ -640,10 +632,8 @@
         if (window.geofs.pause || document.hidden) return;
         initFuel();
 
-        // Progressive refuel tick
         tickRefuel();
 
-        // Burn — uses actual tick interval so math stays correct at any Hz
         const engineOn = window.geofs.aircraft.instance.engine.on;
         if (engineOn && fuelState.fuel > 0 && !fuelState.refuelling) {
             const burned = (calculateBurnRate() / 3600) * TICK_S;
@@ -657,21 +647,19 @@
         updateHUD();
     }
 
-    // ──────────────────────────────────────────────────────────
-    // KEYBOARD
-    // ──────────────────────────────────────────────────────────
     document.addEventListener('keydown', e => {
         if (e.key === 'h' || e.key === 'H') hudVisible = !hudVisible;
     });
 
-    // ──────────────────────────────────────────────────────────
-    // START
-    // ──────────────────────────────────────────────────────────
     console.log('[GeoFS Fuel System v' + VERSION + '] 5 Hz updates | Progressive refuel | H = toggle HUD');
     setInterval(fuelUpdate, TICK_MS);
     setInterval(() => {
-        if (window.geofs.aircraft.instance.aircraftRecord.id !== fuelState.lastAircraft)
+        const inst = window.geofs.aircraft.instance;
+        if (!inst || !inst.aircraftRecord) return;
+        const id = inst.aircraftRecord.id;
+        if (id !== fuelState.lastAircraft) {
             fuelState.initialized = false;
+        }
     }, 2000);
 
 })();
