@@ -1,3 +1,3 @@
 # Geofs-fuel-system
 
-Just another fuel counter for fighter jets.
+fuel counter for fighter jets.
