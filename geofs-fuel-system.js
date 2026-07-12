@@ -1,24 +1,23 @@
 // ==============================================================
-// GeoFS Fighter Jet Realistic Fuel System
-// Version: 4.2.0 (F-35B tuned burn & AB detection)
+// GeoFS Aircraft Realistic Fuel System (Fighters + Civilian)
+// Version: 4.3.0 (Civilian aircraft fuel support added)
 // ==============================================================
 
 (function () {
     'use strict';
 
-    const VERSION           = '4.2.0';
+    const VERSION           = '4.3.0';
     const TICK_MS           = 200;         // update interval — 5 Hz
     const TICK_S            = TICK_MS / 1000;
     const REFUEL_DURATION_S = 45;         // seconds to fill from 0 → 100 %
 
-    // ── Aircraft fuel database ────────────────────────────────
+    // ── Fighter fuel database ─────────────────────────────────
     const FIGHTER_FUEL_DB = {
         'f-16':        { capacity:  3175, engines: 1, name: 'F-16 Fighting Falcon'  },
         'f/a-18f':     { capacity:  6532, engines: 2, name: 'F/A-18F Super Hornet'  },
         'f-14':        { capacity:  7348, engines: 2, name: 'F-14B Tomcat'          },
         'f-15':        { capacity:  6103, engines: 2, name: 'F-15C Eagle'           },
         'f-22':        { capacity:  8200, engines: 2, name: 'F-22 Raptor'           },
-        // F-35B internal fuel ≈ 6125 kg (13,500 lb) — realistic
         'f-35':        { capacity:  6125, engines: 1, name: 'F-35B Lightning II'    },
         'yf-23':       { capacity:  8600, engines: 2, name: 'YF-23'                 },
         'su-35':       { capacity: 11500, engines: 2, name: 'Su-35'                 },
@@ -31,13 +30,35 @@
         't-38':        { capacity:  1540, engines: 2, name: 'T-38 Talon'            }
     };
 
+    // ── Civilian fuel database (approximate usable capacities) ─
+    const CIVILIAN_FUEL_DB = {
+        'a380':        { capacity: 253000, engines: 4, name: 'Airbus A380'              },
+        '737-700':     { capacity:  20800, engines: 2, name: 'Boeing 737-700'            },
+        'concorde':    { capacity:  95680, engines: 4, name: 'Concorde'                  },
+        'a350':        { capacity: 109000, engines: 2, name: 'Airbus A350'               },
+        '777-300er':   { capacity: 145000, engines: 2, name: 'Boeing 777-300ER'          },
+        'piper cub':   { capacity:     32, engines: 1, name: 'Piper J-3 Cub'             },
+        'j-3 cub':     { capacity:     32, engines: 1, name: 'Piper J-3 Cub'             },
+        'cessna 172':  { capacity:    152, engines: 1, name: 'Cessna 172'                },
+        'phenom 100':  { capacity:   1272, engines: 2, name: 'Embraer Phenom 100'        },
+        'twin otter':  { capacity:    954, engines: 2, name: 'de Havilland DHC-6 Twin Otter' },
+        'dhc6':        { capacity:    954, engines: 2, name: 'de Havilland DHC-6 Twin Otter' },
+        'dhc-6':       { capacity:    954, engines: 2, name: 'de Havilland DHC-6 Twin Otter' },
+        'pitts':       { capacity:     79, engines: 1, name: 'Pitts Special S1'          },
+        's1':          { capacity:     79, engines: 1, name: 'Pitts Special S1'          },
+        'ec135':       { capacity:    700, engines: 2, name: 'Eurocopter EC135'          },
+        'ec-135':      { capacity:    700, engines: 2, name: 'Eurocopter EC135'          }
+    };
+
+    // ── Combined lookup table used everywhere ──────────────────
+    const AIRCRAFT_FUEL_DB = Object.assign({}, FIGHTER_FUEL_DB, CIVILIAN_FUEL_DB);
+
     // ── State ─────────────────────────────────────────────────
     let fuelState = {
         fuel:             0,
         maxFuel:          0,
         initialized:      false,
         lastAircraft:     null,
-        // Refuelling
         refuelling:       false,
         refuelStartFuel:  0,
         refuelStartTime:  null,
@@ -49,7 +70,6 @@
     let dragOffsetX = 0, dragOffsetY = 0;
     let hudLeft     = null, hudTop = null;
 
-    // ── Settings ──────────────────────────────────────────────
     const settings = {
         dynamicBingoEnabled: false,
         autoNearestBase:     true,
@@ -61,11 +81,11 @@
     };
 
     // ──────────────────────────────────────────────────────────
-    // AIRCRAFT DETECTION
+    // AIRCRAFT DETECTION (fighters + civilian)
     // ──────────────────────────────────────────────────────────
     function detectAircraftType() {
         const name = (window.geofs.aircraft.instance.aircraftRecord.name || '').toLowerCase();
-        for (const key of Object.keys(FIGHTER_FUEL_DB)) {
+        for (const key of Object.keys(AIRCRAFT_FUEL_DB)) {
             if (name.includes(key)) return key;
         }
         const eng = window.geofs.aircraft.instance.engines;
@@ -75,13 +95,13 @@
 
     function getFuelCapacity() {
         const acType = detectAircraftType();
-        if (acType && FIGHTER_FUEL_DB[acType]) return FIGHTER_FUEL_DB[acType].capacity;
+        if (acType && AIRCRAFT_FUEL_DB[acType]) return AIRCRAFT_FUEL_DB[acType].capacity;
         const mass = window.geofs.aircraft.instance.definition.mass;
         return Math.round(mass * 0.28);
     }
 
     // ──────────────────────────────────────────────────────────
-    // AFTERburner DETECTION
+    // AFTERBURNER DETECTION
     // ──────────────────────────────────────────────────────────
     function getAbThrust(engine) {
         return engine.afterBurnerThrust || engine.afterburnerThrust || 0;
@@ -98,21 +118,18 @@
         if (!engines || !engines.length) return false;
         const e = engines[0];
 
-        // 1) Explicit flags commonly used in GeoFS aircraft
         if (e.afterburnerLit != null)   return !!e.afterburnerLit;
         if (e.afterburnerOn  != null)   return !!e.afterburnerOn;
         if (e.abLit          != null)   return !!e.abLit;
         if (e.abOn           != null)   return !!e.abOn;
         if (typeof e.afterburner === 'boolean') return e.afterburner;
 
-        // 2) Thrust ratio — if current thrust is clearly above dry thrust, treat as AB
         const dry   = e.thrust || 0;
         const live  = e.currentThrust || e.outputThrust || 0;
-        if (dry > 0 && live > dry * 1.20) { // slightly more lenient than 1.05
+        if (dry > 0 && live > dry * 1.20) {
             return true;
         }
 
-        // 3) Throttle threshold as final fallback
         return throttle > 0.92;
     }
 
@@ -130,24 +147,20 @@
         const totalAbThrust   = engines.reduce((s, e) => s + getAbThrust(e), 0);
         const abActive        = isAbActive(engines, throttle);
 
-        // Tunable ratios:
-        const idleFractionOfMil = 0.08;  // idle ≈ 8% of mil fuel flow
-        const abFactorOverMil   = 1.6;   // AB ≈ 60% more fuel than mil
+        const idleFractionOfMil = 0.08;
+        const abFactorOverMil   = 1.6;
 
-        // Mil fuel tied to dry thrust: higher divisor = longer endurance
         const fullMilBurnRate = totalDryThrust / 22;
         const idleBurnRate    = fullMilBurnRate * idleFractionOfMil;
 
         if (abActive && totalAbThrust > 0) {
             const abBurnRate = fullMilBurnRate * abFactorOverMil;
-            // Blend AB near top of throttle only
-            const abBlend = Math.max(0, throttle - 0.85) / 0.15; // 0 at 0.85, 1 at 1.0
+            const abBlend = Math.max(0, throttle - 0.85) / 0.15;
             return idleBurnRate +
                    (fullMilBurnRate - idleBurnRate) * throttle +
                    (abBurnRate - fullMilBurnRate) * abBlend;
         }
 
-        // Dry (idle → mil)
         return idleBurnRate + throttle * (fullMilBurnRate - idleBurnRate);
     }
 
@@ -515,7 +528,7 @@
         const engines  = window.geofs.aircraft.instance.engines;
         const abActive = isAbActive(engines, throttle);
         const acType   = detectAircraftType();
-        const acData   = acType && FIGHTER_FUEL_DB[acType];
+        const acData   = acType && AIRCRAFT_FUEL_DB[acType];
 
         const acNameEl = document.getElementById('fuel-ac-name');
         if (acNameEl) acNameEl.textContent = acData
@@ -649,7 +662,7 @@
         if (e.key === 'h' || e.key === 'H') hudVisible = !hudVisible;
     });
 
-    console.log('[GeoFS Fuel System v' + VERSION + '] 5 Hz updates | Progressive refuel | H = toggle HUD');
+    console.log('[GeoFS Fuel System v' + VERSION + '] Fighters + Civilian | 5 Hz updates | Progressive refuel | H = toggle HUD');
     setInterval(fuelUpdate, TICK_MS);
     setInterval(() => {
         const inst = window.geofs.aircraft.instance;
