@@ -302,3 +302,206 @@
     }, 2000);
 
 })();
+    // Aircraft "has an afterburner" if the DB explicitly says so, OR (for unknown
+    // aircraft) the engine model itself reports non-zero AB thrust.
+    function hasAfterburner(engines) {
+        const data = getAircraftData();
+        if (data) return !!data.hasAb;
+        if (!engines || !engines.length) return false;
+        const e = engines[0];
+        return (e.afterBurnerThrust != null && e.afterBurnerThrust > 0) ||
+               (e.afterburnerThrust != null && e.afterburnerThrust > 0);
+    }
+
+    function isAbActive(engines, throttle) {
+        if (!hasAfterburner(engines)) return false;   // hard gate — fixes false "AB ON" on non-AB aircraft
+        if (!engines || !engines.length) return false;
+        const e = engines[0];
+
+@@ -134,18 +166,33 @@
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // BURN RATE  (kg / hr)
+    // Fighters (burnProfile === null): thrust-based mil/AB model.
+    // Civilian/data-driven aircraft (burnProfile set): idle -> cruise -> max
+    // kg/hr curve interpolated by throttle, sourced from real performance data.
+    // ──────────────────────────────────────────────────────────
+    function calculateBurnRate() {
+        const instance = window.geofs.aircraft.instance;
+        if (!instance.engine || !instance.engine.on) return 0;
+        const engines = instance.engines;
+        if (!engines || engines.length === 0) return 0;
+
+        const throttle = Math.abs(window.geofs.animation.values.smoothThrottle || 0);
+        const data     = getAircraftData();
+
+        if (data && data.burnProfile) {
+            const { idleKgHr, cruiseKgHr, maxKgHr } = data.burnProfile;
+            if (throttle <= 0.7) {
+                return idleKgHr + (throttle / 0.7) * (cruiseKgHr - idleKgHr);
+            }
+            const t = (throttle - 0.7) / 0.3;
+            return cruiseKgHr + t * (maxKgHr - cruiseKgHr);
+        }
+
+        // Fallback: thrust-based fighter model
+        const totalDryThrust  = engines.reduce((s, e) => s + (e.thrust || 0), 0);
+        const totalAbThrust   = engines.reduce((s, e) => s + getAbThrust(e), 0);
+        const abActive        = isAbActive(engines, throttle); // already gated by hasAfterburner()
+
+        const idleFractionOfMil = 0.08;
+        const abFactorOverMil   = 1.6;
+@@ -165,6 +212,9 @@
+    }
+
+    function getPlanningBurnRate() {
+        const data = getAircraftData();
+        if (data && data.burnProfile) return data.burnProfile.cruiseKgHr;
+
+        const engines = window.geofs.aircraft.instance.engines || [];
+        if (!engines.length) return 0;
+        const totalDry  = engines.reduce((s, e) => s + (e.thrust || 0), 0);
+@@ -483,7 +533,7 @@
+            +     '<span>FUEL: <span id="fuel-kg">0</span> kg</span>'
+            +     '<span>BURN: <span id="burn-rate">0</span> kg/hr</span>'
+            +   '</div>'
+            +   '<div id="ab-row" style="display:flex;justify-content:space-between;font-size:10px;">'
+            +     '<span>ENDUR: <span id="endurance">--</span></span>'
+            +     '<span>AB: <span id="ab-status" style="color:#ff8800;">OFF</span></span>'
+            +   '</div>'
+@@ -526,9 +576,9 @@
+        const burnRate = calculateBurnRate();
+        const throttle = Math.abs(window.geofs.animation.values.smoothThrottle || 0);
+        const engines  = window.geofs.aircraft.instance.engines;
+        const acData   = getAircraftData();
+        const abCapable = hasAfterburner(engines);
+        const abActive  = abCapable ? isAbActive(engines, throttle) : false;
+
+        const acNameEl = document.getElementById('fuel-ac-name');
+        if (acNameEl) acNameEl.textContent = acData
+@@ -556,121 +606,124 @@
+            } else { endEl.textContent = '--'; }
+        }
+
+        // AB indicator only shown for aircraft that actually have an afterburner
+        const abStatusEl = document.getElementById('ab-status');
+        const abLabelSpan = abStatusEl ? abStatusEl.parentElement : null; // "AB: <span>"
+        if (abLabelSpan) abLabelSpan.style.display = abCapable ? 'inline' : 'none';
+        if (abStatusEl) { abStatusEl.textContent = abActive ? 'ON' : 'OFF'; abStatusEl.style.color = abActive ? '#ff4400' : '#ff8800'; }
+
+        const rfWrap = document.getElementById('refuel-bar-wrap');
+        const rfBar  = document.getElementById('refuel-bar');
+        const rfStat = document.getElementById('refuel-status');
+        if (fuelState.refuelling) {
+            const elapsed  = (Date.now() - fuelState.refuelStartTime) / 1000;
+            const progress = Math.min(1, elapsed / fuelState.refuelDuration) * 100;
+            const secsLeft = Math.ceil(fuelState.refuelDuration - elapsed);
+            if (rfWrap) rfWrap.style.display = 'block';
+            if (rfBar)  rfBar.style.width     = progress + '%';
+            if (rfStat) { rfStat.style.display = 'block'; rfStat.textContent = '\u26fd Fuelling… ' + secsLeft + 's'; }
+        } else {
+            if (rfWrap) rfWrap.style.display = 'none';
+            if (rfStat) rfStat.style.display = 'none';
+        }
+
+        const dyn    = calculateDynamicBingo();
+        const dynBox = document.getElementById('dynamic-bingo-box');
+        if (dynBox) dynBox.style.display = dyn ? 'block' : 'none';
+        if (dyn) {
+            const dfEl = document.getElementById('dynamic-bingo-fuel');
+            const dbEl = document.getElementById('dynamic-bingo-base');
+            const ddEl = document.getElementById('dynamic-bingo-dist');
+            if (dfEl) dfEl.textContent = dyn.bingoFuel.toFixed(0) + ' kg';
+            if (dbEl) dbEl.textContent = dyn.baseName;
+            if (ddEl) ddEl.textContent = dyn.distanceKm.toFixed(0) + ' km';
+        }
+
+        const warnEl = document.getElementById('fuel-warn');
+        if (warnEl) {
+            const rtbHit = dyn && fuelState.fuel <= dyn.bingoFuel;
+            if (pct <= 10) {
+                warnEl.style.display = 'block'; warnEl.style.color = '#ff2244';
+                warnEl.textContent   = '\ud83d\udea8 CRITICAL FUEL';
+            } else if (rtbHit) {
+                warnEl.style.display = 'block'; warnEl.style.color = '#ffaa00';
+                warnEl.textContent   = '\u26a0 RETURN FUEL MIN';
+            } else if (pct <= 25) {
+                warnEl.style.display = 'block'; warnEl.style.color = '#ff2244';
+                warnEl.textContent   = '\u26a0 BINGO FUEL';
+            } else {
+                warnEl.style.display = 'none';
+            }
+        }
+
+        const refuelBtn = document.getElementById('geofs-refuel-btn');
+        if (refuelBtn) {
+            const og = window.geofs.aircraft.instance.groundContact;
+            const eo = window.geofs.aircraft.instance.engine.on;
+            const gs = window.geofs.aircraft.instance.groundSpeed;
+            const showBtn = og && !eo && gs < 1;
+            refuelBtn.style.display = showBtn ? 'block' : 'none';
+            refuelBtn.textContent   = fuelState.refuelling ? '\u26fd CANCEL' : '\u26fd REFUEL';
+            refuelBtn.style.borderColor   = fuelState.refuelling ? 'rgba(255,100,0,0.5)' : 'rgba(234,179,8,0.4)';
+            refuelBtn.style.color         = fuelState.refuelling ? '#ff6600'              : '#eab308';
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // INIT & MAIN LOOP
+    // ──────────────────────────────────────────────────────────
+    function initFuel() {
+        const inst = window.geofs.aircraft.instance;
+        if (!inst || !inst.aircraftRecord) return;
+        const id = inst.aircraftRecord.id;
+
+        if (fuelState.lastAircraft !== id || !fuelState.initialized) {
+            fuelState.maxFuel      = getFuelCapacity();
+            if (!fuelState.initialized || fuelState.lastAircraft !== id) {
+                fuelState.fuel = fuelState.maxFuel;
+            }
+            fuelState.lastAircraft = id;
+            fuelState.initialized  = true;
+            console.log('[Fuel v' + VERSION + '] ' + detectAircraftType() + ' | Capacity: ' + fuelState.maxFuel + ' kg');
+        }
+
+        if (!document.getElementById('geofs-fuel-hud')) {
+            createHUD();
+        }
+    }
+
+    function fuelUpdate() {
+        if (window.geofs.pause || document.hidden) return;
+        initFuel();
+
+        tickRefuel();
+
+        const engineOn = window.geofs.aircraft.instance.engine.on;
+        if (engineOn && fuelState.fuel > 0 && !fuelState.refuelling) {
+            const burned = (calculateBurnRate() / 3600) * TICK_S;
+            fuelState.fuel = Math.max(0, fuelState.fuel - burned);
+            if (fuelState.fuel <= 0) {
+                window.geofs.aircraft.instance.stopEngine();
+                console.warn('[Fuel] FUEL EXHAUSTED — engine shutdown');
+            }
+        }
+
+        updateHUD();
+    }
+
+    document.addEventListener('keydown', e => {
+        if (e.key === 'h' || e.key === 'H') hudVisible = !hudVisible;
+    });
+
+    console.log('[GeoFS Fuel System v' + VERSION + '] Fighters + Civilian | 5 Hz updates | Progressive refuel | H = toggle HUD');
+    setInterval(fuelUpdate, TICK_MS);
+    setInterval(() => {
+        const inst = window.geofs.aircraft.instance;
+        if (!inst || !inst.aircraftRecord) return;
+        const id = inst.aircraftRecord.id;
+        if (id !== fuelState.lastAircraft) {
+            fuelState.initialized = false;
+        }
+    }, 2000);
+
+})();
